@@ -1,0 +1,70 @@
+- hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+      ansible_ssh_extra_args: '-o StrictHostKeyChecking=no'
+
+  tasks:
+
+  - name: Determine public IP
+    command: curl ifconfig.co
+    register: my_ip
+    check_mode: no
+
+  - name: Create terraform vars (minishift.auto.tfvars)
+    copy:
+      dest: "{{ playbook_dir }}/minishift.auto.tfvars"
+      content: |
+        access_ip = "{{ my_ip.stdout }}/32"
+
+  - name: Terraform plan
+    terraform:
+        project_path: "{{ playbook_dir }}"
+        state: planned
+        plan_file: minishift.plan
+
+  - name: Terraform apply
+    terraform:
+        project_path: "{{ playbook_dir }}"
+        plan_file: minishift.plan
+    register: tfout
+
+  - set_fact:
+      minishift_dns: "{{ tfout.outputs.instance_public_dns.value }}"
+      minishift_ip: "{{ tfout.outputs.instance_public_ip.value }}"
+
+  - debug: var=minishift_dns
+
+  - name: Wait 300 seconds for port 22 to become available
+    wait_for:
+      port: 22
+      host: '{{ minishift_ip }}'
+      search_regex: OpenSSH
+      delay: 10
+    connection: local
+
+  # CentOS doesn't have a group to share docker.sock (sic!) and thus we need to use root login
+  - name: Enable root login
+    shell: "sed -i 's/.* \\(ssh-rsa .*\\)/\\1/' /root/.ssh/authorized_keys"
+    delegate_to: "{{ minishift_dns }}"
+    remote_user: centos
+    become: true
+    register: task_result
+    until: task_result.rc == 0
+    retries: 30
+    delay: 3
+    ignore_errors: yes
+
+  - name: Fix firewall rule - allow traffic to https
+    shell: |
+      yum install -y firewalld
+      systemctl enable firewalld
+      systemctl start firewalld
+      firewall-cmd --zone=public --add-service=https --permanent
+      firewall-cmd --reload
+    delegate_to: "{{ minishift_dns }}"
+    remote_user: centos
+    become: true
+
+  - name: Print provisioning command for minishift
+    debug: msg="export MINISHIFT_HOME=~/.minishift-aws;minishift config set openshift-version v3.11.0; minishift addon enable admin-user; minishift addon enable xpaas; minishift addon enable anyuid; minishift start  --openshift-version v3.11.0 --remote-ssh-user root --vm-driver generic --public-hostname {{ minishift_dns }} --routing-suffix {{ minishift_ip }}.nip.io --remote-ipaddress {{ minishift_dns }} --remote-ssh-key $HOME/.ssh/id_rsa"
